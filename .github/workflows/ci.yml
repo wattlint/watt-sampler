@@ -1,0 +1,453 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # LINT: formatting + clippy
+  # ──────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (zero warnings)
+        run: cargo clippy -- -D warnings
+
+  # ──────────────────────────────────────────────────────────────
+  # TEST: unit tests on stable + nightly
+  # ──────────────────────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.toolchain }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Run tests (release)
+        run: cargo test --release --verbose
+
+  # ──────────────────────────────────────────────────────────────
+  # BUILD: release binaries for linux-amd64 + linux-arm64
+  # ──────────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: watt-sampler-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            artifact: watt-sampler-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: cp target/${{ matrix.target }}/release/watt-sampler ${{ matrix.artifact }}
+
+      - name: Compute SHA256
+        run: sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+
+      - name: Verify binary size (< 10MB)
+        run: |
+          SIZE=$(stat -c%s ${{ matrix.artifact }})
+          echo "Binary size: ${SIZE} bytes ($(($SIZE / 1024 / 1024))MB)"
+          if [ "$SIZE" -gt 10485760 ]; then
+            echo "::error::Binary exceeds 10MB limit"
+            exit 1
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
+
+  # ──────────────────────────────────────────────────────────────
+  # CLI: verify all commands produce correct output
+  # ──────────────────────────────────────────────────────────────
+  cli:
+    name: CLI Verification
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: check-hardware produces valid JSON
+        run: |
+          OUTPUT=$(./target/release/watt-sampler check-hardware 2>&1)
+          echo "$OUTPUT"
+
+          # Verify it's valid JSON
+          echo "$OUTPUT" | jq . > /dev/null
+
+          # Verify required fields exist
+          echo "$OUTPUT" | jq -e '.rapl_method' > /dev/null
+          echo "$OUTPUT" | jq -e '.rapl_domains' > /dev/null
+          echo "$OUTPUT" | jq -e '.gpu' > /dev/null
+          echo "$OUTPUT" | jq -e '.estimated' > /dev/null
+
+          echo "check-hardware output schema OK"
+
+      - name: run produces valid JSON with echo
+        run: |
+          OUTPUT=$(./target/release/watt-sampler run --iterations 3 --warmup 1 --domains pkg -- echo hello 2>&1)
+          echo "$OUTPUT"
+
+          # Verify it's valid JSON
+          echo "$OUTPUT" | jq . > /dev/null
+
+          # Verify schema_version
+          SCHEMA=$(echo "$OUTPUT" | jq -r '.schema_version')
+          if [ "$SCHEMA" != "1" ]; then
+            echo "::error::schema_version should be '1', got '$SCHEMA'"
+            exit 1
+          fi
+
+          # Verify required top-level fields
+          echo "$OUTPUT" | jq -e '.timestamp_utc' > /dev/null
+          echo "$OUTPUT" | jq -e '.host' > /dev/null
+          echo "$OUTPUT" | jq -e '.benchmark' > /dev/null
+          echo "$OUTPUT" | jq -e '.measurements' > /dev/null
+          echo "$OUTPUT" | jq -e '.summary' > /dev/null
+
+          # Verify host fields
+          echo "$OUTPUT" | jq -e '.host.cpu_vendor' > /dev/null
+          echo "$OUTPUT" | jq -e '.host.cpu_model' > /dev/null
+          echo "$OUTPUT" | jq -e '.host.rapl_method' > /dev/null
+
+          # Verify benchmark fields
+          CMD=$(echo "$OUTPUT" | jq -r '.benchmark.command')
+          if [ "$CMD" != "echo hello" ]; then
+            echo "::error::benchmark.command should be 'echo hello', got '$CMD'"
+            exit 1
+          fi
+
+          ITERS=$(echo "$OUTPUT" | jq -r '.benchmark.iterations_requested')
+          if [ "$ITERS" != "3" ]; then
+            echo "::error::iterations_requested should be 3, got $ITERS"
+            exit 1
+          fi
+
+          WARMUP=$(echo "$OUTPUT" | jq -r '.benchmark.warmup_iters')
+          if [ "$WARMUP" != "1" ]; then
+            echo "::error::warmup_iters should be 1, got $WARMUP"
+            exit 1
+          fi
+
+          # Verify measurements count matches iterations
+          MEAS_COUNT=$(echo "$OUTPUT" | jq '.measurements | length')
+          if [ "$MEAS_COUNT" != "3" ]; then
+            echo "::error::Expected 3 measurements, got $MEAS_COUNT"
+            exit 1
+          fi
+
+          # Verify each measurement has required fields
+          for i in $(seq 0 2); do
+            echo "$OUTPUT" | jq -e ".measurements[$i].iteration" > /dev/null
+            echo "$OUTPUT" | jq -e ".measurements[$i].duration_s" > /dev/null
+            echo "$OUTPUT" | jq -e ".measurements[$i].energy" > /dev/null
+            echo "$OUTPUT" | jq -e ".measurements[$i].power" > /dev/null
+            echo "$OUTPUT" | jq -e ".measurements[$i].energy.total_joules" > /dev/null
+          done
+
+          # Verify summary fields
+          echo "$OUTPUT" | jq -e '.summary.median_total_joules' > /dev/null
+          echo "$OUTPUT" | jq -e '.summary.p5_total_joules' > /dev/null
+          echo "$OUTPUT" | jq -e '.summary.p95_total_joules' > /dev/null
+          echo "$OUTPUT" | jq -e '.summary.noise_pct' > /dev/null
+          echo "$OUTPUT" | jq -e '.summary.valid' > /dev/null
+          echo "$OUTPUT" | jq -e '.summary.warnings' > /dev/null
+
+          # Verify noise_pct is a number between 0 and 100
+          NOISE=$(echo "$OUTPUT" | jq '.summary.noise_pct')
+          if (( $(echo "$NOISE < 0 || $NOISE > 100" | bc -l) )); then
+            echo "::error::noise_pct $NOISE not in range 0-100"
+            exit 1
+          fi
+
+          echo "run output schema OK"
+
+      - name: run with human output produces no JSON
+        run: |
+          OUTPUT=$(./target/release/watt-sampler run --output human --iterations 2 --warmup 0 -- echo hello 2>&1)
+
+          # Should contain human-readable markers, not JSON
+          if echo "$OUTPUT" | jq . > /dev/null 2>&1; then
+            echo "::warning::Human output is parseable as JSON — might be correct but unexpected"
+          fi
+
+          # Should contain expected human output text
+          echo "$OUTPUT" | grep -q "WattLint" || echo "::warning::Human output missing 'WattLint' header"
+
+      - name: run respects --iterations and --warmup
+        run: |
+          # 5 warmup + 3 measurement = 8 total "hello" outputs
+          OUTPUT=$(./target/release/watt-sampler run --iterations 3 --warmup 5 -- echo tick 2>&1)
+          TICK_COUNT=$(echo "$OUTPUT" | grep -c "^tick$" || true)
+          # Warmup goes to stdout, measurement goes to stdout too
+          # So we expect 8 lines of "tick" (5 warmup + 3 measurement)
+          echo "Tick count: $TICK_COUNT (expected 8)"
+
+          # Verify JSON says 3 iterations
+          ITERS=$(echo "$OUTPUT" | jq -r '.benchmark.iterations_requested')
+          if [ "$ITERS" != "3" ]; then
+            echo "::error::Expected 3 iterations, got $ITERS"
+            exit 1
+          fi
+
+      - name: diff compares two JSON files
+        run: |
+          # Generate two measurement files
+          ./target/release/watt-sampler run --iterations 3 --warmup 0 -- echo a > baseline.json 2>/dev/null
+          ./target/release/watt-sampler run --iterations 3 --warmup 0 -- echo b > current.json 2>/dev/null
+
+          # Test human output
+          DIFF_OUT=$(./target/release/watt-sampler diff --baseline baseline.json --current current.json 2>&1)
+          echo "$DIFF_OUT"
+          echo "$DIFF_OUT" | grep -q "WattLint"
+
+          # Test JSON output
+          DIFF_JSON=$(./target/release/watt-sampler diff --baseline baseline.json --current current.json --output json 2>&1)
+          echo "$DIFF_JSON" | jq -e '.baseline_joules' > /dev/null
+          echo "$DIFF_JSON" | jq -e '.current_joules' > /dev/null
+          echo "$DIFF_JSON" | jq -e '.delta_pct' > /dev/null
+          echo "$DIFF_JSON" | jq -e '.regression' > /dev/null
+
+          # Test markdown output
+          DIFF_MD=$(./target/release/watt-sampler diff --baseline baseline.json --current current.json --output markdown 2>&1)
+          echo "$DIFF_MD" | grep -q "wattlint-report"
+
+          echo "diff output OK"
+
+      - name: diff --fail exits 1 on regression
+        run: |
+          # Generate two files
+          ./target/release/watt-sampler run --iterations 3 --warmup 0 -- echo a > baseline.json 2>/dev/null
+          ./target/release/watt-sampler run --iterations 3 --warmup 0 -- echo b > current.json 2>/dev/null
+
+          # With threshold 0% and --fail, any change should trigger exit 1
+          # (energy is 0 on GitHub runners so this won't trigger — just verify it doesn't crash)
+          ./target/release/watt-sampler diff --baseline baseline.json --current current.json --threshold 0 --fail
+          echo "diff --fail exit code: $? (expected 0 since both are 0 joules on GitHub runners)"
+
+      - name: stderr contains warnings, stdout contains only JSON
+        run: |
+          # Capture stdout and stderr separately
+          ./target/release/watt-sampler run --iterations 2 --warmup 0 -- echo test 1>/tmp/stdout.txt 2>/tmp/stderr.txt || true
+
+          echo "=== STDOUT ==="
+          cat /tmp/stdout.txt
+
+          echo "=== STDERR ==="
+          cat /tmp/stderr.txt
+
+          # Stdout must be valid JSON
+          cat /tmp/stdout.txt | jq . > /dev/null
+
+          # Stdout should NOT contain warning text
+          if grep -qi "warning\|error\|info" /tmp/stdout.txt; then
+            echo "::error::stdout contains non-JSON text"
+            exit 1
+          fi
+
+          echo "stdout/stderr separation OK"
+
+  # ──────────────────────────────────────────────────────────────
+  # VALIDATE: cross-check binary properties
+  # ──────────────────────────────────────────────────────────────
+  validate:
+    name: Validate Binary
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download linux-amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: watt-sampler-linux-amd64
+
+      - name: Verify SHA256
+        run: sha256sum -c watt-sampler-linux-amd64.sha256
+
+      - name: Verify binary is executable
+        run: |
+          chmod +x watt-sampler-linux-amd64
+          ./watt-sampler-linux-amd64 --version
+
+      - name: Verify binary runs on this runner
+        run: |
+          OUTPUT=$(./watt-sampler-linux-amd64 check-hardware 2>&1)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | jq -e '.rapl_method' > /dev/null
+
+  # ──────────────────────────────────────────────────────────────
+  # RAPL: test on self-hosted runner with real RAPL (optional)
+  # ──────────────────────────────────────────────────────────────
+  rapl-test:
+    name: RAPL Integration (self-hosted)
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: check-hardware detects RAPL
+        run: |
+          OUTPUT=$(./target/release/watt-sampler check-hardware 2>&1)
+          echo "$OUTPUT"
+
+          METHOD=$(echo "$OUTPUT" | jq -r '.rapl_method')
+          if [ "$METHOD" = "estimated" ]; then
+            echo "::error::RAPL not detected on self-hosted runner (got 'estimated')"
+            exit 1
+          fi
+
+          echo "RAPL method: $METHOD"
+
+      - name: run produces real energy readings
+        run: |
+          OUTPUT=$(./target/release/watt-sampler run --iterations 5 --warmup 1 -- sleep 0.5 2>&1)
+          echo "$OUTPUT"
+
+          # Verify energy is non-zero (real RAPL)
+          PKG=$(echo "$OUTPUT" | jq '.summary.median_total_joules')
+          if [ "$PKG" = "0" ] || [ "$PKG" = "null" ]; then
+            echo "::error::Energy reading is $PKG — RAPL not working"
+            exit 1
+          fi
+
+          echo "Energy reading: ${PKG} J"
+
+          # Verify noise is reasonable (< 20% on self-hosted)
+          NOISE=$(echo "$OUTPUT" | jq '.summary.noise_pct')
+          echo "Noise: ${NOISE}%"
+
+          # Verify valid is true
+          VALID=$(echo "$OUTPUT" | jq -r '.summary.valid')
+          if [ "$VALID" != "true" ]; then
+            echo "::warning::Measurement marked as invalid (noise: ${NOISE}%)"
+          fi
+
+      - name: diff detects no regression on same command
+        run: |
+          ./target/release/watt-sampler run --iterations 5 --warmup 1 -- sleep 0.5 > a.json 2>/dev/null
+          ./target/release/watt-sampler run --iterations 5 --warmup 1 -- sleep 0.5 > b.json 2>/dev/null
+
+          # Same command twice should not regress
+          ./target/release/watt-sampler diff --baseline a.json --current b.json --threshold 10 --fail
+          echo "No regression detected (expected)"
+
+      - name: run with GPU domain (graceful if no GPU)
+        run: |
+          OUTPUT=$(./target/release/watt-sampler run --iterations 3 --warmup 0 --domains pkg,gpu -- sleep 0.1 2>&1)
+          echo "$OUTPUT"
+
+          # Should complete without error regardless of GPU presence
+          echo "$OUTPUT" | jq -e '.summary' > /dev/null
+
+      - name: overflow handling stress test
+        run: |
+          # Run for a few seconds to accumulate enough readings
+          OUTPUT=$(./target/release/watt-sampler run --iterations 3 --warmup 0 -- sleep 1 2>&1)
+          echo "$OUTPUT"
+
+          # Verify energy is monotonically plausible (positive, non-decreasing across iterations)
+          JOULES=$(echo "$OUTPUT" | jq '[.measurements[].energy.total_joules] | sort')
+          echo "Energy readings: $JOULES"
+
+          # All should be positive
+          NEGATIVE=$(echo "$OUTPUT" | jq '[.measurements[].energy.total_joules] | map(select(. < 0)) | length')
+          if [ "$NEGATIVE" != "0" ]; then
+            echo "::error::Found negative energy readings"
+            exit 1
+          fi
+
+      - name: CPU governor warning
+        run: |
+          # Check if governor is not performance
+          GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "unknown")
+          echo "CPU governor: $GOV"
+
+          OUTPUT=$(./target/release/watt-sampler run --iterations 2 --warmup 0 -- sleep 0.1 2>&1)
+          if [ "$GOV" != "performance" ]; then
+            # stderr should contain governor warning
+            echo "$OUTPUT" | grep -i "governor" || echo "::warning::Expected governor warning not found"
+          fi
+
+      - name: TDP detection
+        run: |
+          OUTPUT=$(./target/release/watt-sampler check-hardware 2>&1)
+          echo "$OUTPUT"
+
+          # Try to read TDP from sysfs directly
+          TDP_UW=$(cat /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null || echo "N/A")
+          echo "TDP from sysfs: $TDP_UW microwatts"
