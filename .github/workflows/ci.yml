@@ -315,12 +315,18 @@ jobs:
           ./target/release/watt-sampler run --iterations 3 --warmup 0 -- echo b 2>/dev/null > /tmp/current.json
           set -e
 
+          # --threshold 0 --fail: any delta triggers exit 1
+          # On GitHub runners with 0J readings, both exit 0 and 1 are valid
           set +e
           ./target/release/watt-sampler diff --baseline /tmp/baseline.json --current /tmp/current.json --threshold 0 --fail
           DIFF_EXIT=$?
           set -e
 
-          echo "diff --fail exit code: $DIFF_EXIT (expected 0 since both are 0 joules on GitHub runners)"
+          if [ "$DIFF_EXIT" -ne 0 ] && [ "$DIFF_EXIT" -ne 1 ]; then
+            echo "::error::diff --fail exited with unexpected code $DIFF_EXIT"
+            exit 1
+          fi
+          echo "diff --fail exit code: $DIFF_EXIT (OK)"
 
       # ── stdout contains only JSON ─────────────────────────────
       - name: stdout contains only JSON
