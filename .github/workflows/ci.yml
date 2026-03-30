@@ -282,6 +282,8 @@ jobs:
           echo "Iteration counting OK"
 
       # ── diff command ─────────────────────────────────────────
+      # diff outputs human-readable to stderr, JSON/markdown to stdout.
+      # Capture each separately to avoid mixed output.
       - name: diff compares two JSON files
         run: |
           set +e
@@ -289,18 +291,17 @@ jobs:
           ./target/release/watt-sampler run --iterations 3 --warmup 0 -- echo b 2>/dev/null > /tmp/current.json
           set -e
 
-          # Test human output
-          DIFF_HUMAN=$(./target/release/watt-sampler diff --baseline /tmp/baseline.json --current /tmp/current.json 2>&1)
-          echo "$DIFF_HUMAN"
+          # Human output (stdout = human text, stderr = child output)
+          ./target/release/watt-sampler diff --baseline /tmp/baseline.json --current /tmp/current.json 2>/dev/null
 
-          # Test JSON output
-          DIFF_JSON=$(./target/release/watt-sampler diff --baseline /tmp/baseline.json --current /tmp/current.json --output json 2>&1)
-          echo "$DIFF_JSON"
-          echo "$DIFF_JSON" | jq -e '.regression' > /dev/null
+          # JSON output (stdout only, stderr suppressed)
+          ./target/release/watt-sampler diff --baseline /tmp/baseline.json --current /tmp/current.json --output json 2>/dev/null > /tmp/diff.json
+          cat /tmp/diff.json
+          jq -e '.regression' /tmp/diff.json > /dev/null
 
-          # Test markdown output
-          DIFF_MD=$(./target/release/watt-sampler diff --baseline /tmp/baseline.json --current /tmp/current.json --output markdown 2>&1)
-          echo "$DIFF_MD"
+          # Markdown output (stdout only, stderr suppressed)
+          ./target/release/watt-sampler diff --baseline /tmp/baseline.json --current /tmp/current.json --output markdown 2>/dev/null > /tmp/diff.md
+          cat /tmp/diff.md
 
           echo "diff output OK"
 
