@@ -165,7 +165,7 @@ fn run_single(
     let start = Instant::now();
     let child = Command::new(&command[0])
         .args(&command[1..])
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
 
@@ -199,7 +199,19 @@ fn run_single(
     });
 
     let mut child = child;
+
+    // Drain child stdout to stderr so output is visible but JSON stays clean on stdout
+    let drain = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            let mut err = std::io::stderr();
+            let _ = std::io::copy(&mut std::io::BufReader::new(out), &mut err);
+        })
+    });
+
     child.wait()?;
+    if let Some(t) = drain {
+        let _ = t.join();
+    }
     child_done.store(true, Ordering::Relaxed);
 
     let duration = start.elapsed().as_secs_f64();
