@@ -297,7 +297,7 @@ jobs:
           # JSON output (stdout only, stderr suppressed)
           ./target/release/watt-sampler diff --baseline /tmp/baseline.json --current /tmp/current.json --output json 2>/dev/null > /tmp/diff.json
           cat /tmp/diff.json
-          jq -e '.regression' /tmp/diff.json > /dev/null
+          jq 'has("regression")' /tmp/diff.json | grep -q true
 
           # Markdown output (stdout only, stderr suppressed)
           ./target/release/watt-sampler diff --baseline /tmp/baseline.json --current /tmp/current.json --output markdown 2>/dev/null > /tmp/diff.md
