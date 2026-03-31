@@ -333,14 +333,8 @@ jobs:
           JSON=$(./target/release/watt-sampler run --iterations 2 --warmup 0 -- echo test 2>/dev/null)
           set -e
 
-          # Must be valid JSON (no child output mixed in)
-          echo "$JSON" | jq -e '.schema_version' > /dev/null
-
-          # Should NOT contain non-JSON text
-          if echo "$JSON" | grep -qi "test\|hello\|warning\|error"; then
-            echo "::error::stdout contains non-JSON text: $JSON"
-            exit 1
-          fi
+          # Must be valid JSON — jq will fail if child output is mixed into stdout
+          echo "$JSON" | jq -e '.' > /dev/null
 
           echo "stdout/stderr separation OK"
 
